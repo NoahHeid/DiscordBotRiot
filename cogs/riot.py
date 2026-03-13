@@ -8,7 +8,7 @@ from db.database import (
     add_rank_snapshot,
     get_account,
     get_all_accounts,
-    get_rank_history,
+    get_rank_changes,
     get_latest_rank,
     set_preferred_name,
     upsert_account,
@@ -217,14 +217,17 @@ class Riot(commands.Cog):
     @commands.command(name="rankHistory")
     async def rank_history(self, ctx: commands.Context) -> None:
         discord_id = str(ctx.author.id)
-        history_rows = get_rank_history(discord_id, limit=10)
+        history_rows = get_rank_changes(discord_id, limit=10)
 
         if not history_rows:
-            await ctx.send("Noch keine Rank-History vorhanden. Warte auf den nächsten 5-Minuten-Check.")
+            await ctx.send("Noch keine Rank-Änderungen vorhanden.")
             return
 
-        lines = [f"{checked_at} UTC → **{rank}**" for rank, checked_at in history_rows]
-        await ctx.send("Deine letzten Rank-Snapshots:\n" + "\n".join(lines))
+        lines = [
+            f"{checked_at} UTC → **{old_rank}** → **{new_rank}**"
+            for old_rank, new_rank, checked_at in history_rows
+        ]
+        await ctx.send("Deine letzten Rank-Changes:\n" + "\n".join(lines))
 
     @commands.command(name="setName")
     async def set_name(self, ctx: commands.Context, *, args: str = "") -> None:

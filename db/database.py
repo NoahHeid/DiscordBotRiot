@@ -141,3 +141,32 @@ def get_rank_history(discord_id: str, limit: int = 10) -> list[tuple[str, str]]:
     ).fetchall()
     con.close()
     return rows
+
+
+def get_rank_changes(discord_id: str, limit: int = 10) -> list[tuple[str, str, str]]:
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        """
+        SELECT rank, checked_at
+        FROM rank_history
+        WHERE discord_id = ?
+        ORDER BY checked_at ASC, id ASC
+        """,
+        (discord_id,),
+    ).fetchall()
+    con.close()
+
+    changes: list[tuple[str, str, str]] = []
+    previous_rank: str | None = None
+
+    for rank, checked_at in rows:
+        if previous_rank is None:
+            previous_rank = rank
+            continue
+
+        if rank != previous_rank:
+            changes.append((previous_rank, rank, checked_at))
+
+        previous_rank = rank
+
+    return list(reversed(changes[-limit:]))
