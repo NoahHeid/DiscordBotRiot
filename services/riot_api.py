@@ -25,10 +25,16 @@ _TAG_TO_REGION: dict[str, tuple[Continent, Region]] = {
 _DEFAULT_REGION = (Continent.EUROPE, Region.EUW)
 
 _TIER_DISPLAY = {
-    "IRON": "Iron", "BRONZE": "Bronze", "SILVER": "Silver",
-    "GOLD": "Gold", "PLATINUM": "Plat", "EMERALD": "Emerald",
-    "DIAMOND": "Diamond", "MASTER": "Master",
-    "GRANDMASTER": "GM", "CHALLENGER": "Challenger",
+    "IRON": "Iron", 
+    "BRONZE": "Bronze", 
+    "SILVER": "Silver",
+    "GOLD": "Gold", 
+    "PLATINUM": "Plat", 
+    "EMERALD": "Emerald",
+    "DIAMOND": "Diamond", 
+    "MASTER": "Master",
+    "GRANDMASTER": "GM", 
+    "CHALLENGER": "Challenger",
 }
 
 _TIER_EMOJI = {
@@ -45,6 +51,22 @@ _TIER_EMOJI = {
 }
 
 _UNRANKED = "N/A ⚪"
+
+_TIER_SCORE: dict[str, int] = {
+    display: (i + 1) * 10
+    for i, display in enumerate(_TIER_DISPLAY.values())
+}
+_DIVISION_SCORE: dict[str, int] = {"IV": 1, "III": 2, "II": 3, "I": 4}
+
+
+def rank_score(rank_str: str) -> int:
+    """Convert a display rank string like 'Gold II 🥇' to a numeric score."""
+    parts = rank_str.split()
+    if not parts or parts[0] == "N/A":
+        return 0
+    tier_val = _TIER_SCORE.get(parts[0], 0)
+    div_val = _DIVISION_SCORE.get(parts[1], 0) if len(parts) > 1 else 0
+    return tier_val + div_val
 
 
 def _format_entry_rank(entry: dict) -> str:

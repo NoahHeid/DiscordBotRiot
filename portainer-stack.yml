@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  ars-victoriae-bot:
+    image: ghcr.io/<owner>/<repo>:latest
+    container_name: ars-victoriae-discord-bot
+    restart: unless-stopped
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN}
+      RIOT_API_KEY: ${RIOT_API_KEY}
+    volumes:
+      - riot_data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  riot_data:
+    name: riot_data

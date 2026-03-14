@@ -13,9 +13,10 @@ from db.database import (
     set_preferred_name,
     upsert_account,
 )
-from services.riot_api import fetch_rank
+from services.riot_api import fetch_rank, rank_score
 
 _MAX_NICK = 32
+_NOTIFIER_ROLE = "BotNotifier"
 logger = logging.getLogger(__name__)
 
 
@@ -38,6 +39,27 @@ class Riot(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
+    # ------------------------------------------------------------------ #
+    #  Helpers                                                             #
+    # ------------------------------------------------------------------ #
+
+    async def _get_or_create_notifier_role(self, guild: discord.Guild) -> discord.Role | None:
+        role = discord.utils.get(guild.roles, name=_NOTIFIER_ROLE)
+        if role is None:
+            try:
+                role = await guild.create_role(
+                    name=_NOTIFIER_ROLE,
+                    mentionable=True,
+                    reason="Auto-created by Ars Victoriae Discord Bot",
+                )
+            except discord.Forbidden:
+                logger.warning("Cannot create %s role in %s (missing permissions)", _NOTIFIER_ROLE, guild.name)
+                return None
+            except discord.HTTPException:
+                logger.exception("Failed to create %s role in %s", _NOTIFIER_ROLE, guild.name)
+                return None
+        return role
+
     async def _notify_rank_change(
         self,
         discord_id: str,
@@ -59,35 +81,59 @@ class Riot(commands.Cog):
                 return
 
             member = guild.get_member(int(discord_id))
-            mention = member.mention if member else f"<@{discord_id}>"
+            person_mention = member.mention if member else f"<@{discord_id}>"
 
-            await channel.send(
-                f"{mention} Rank-Update: **{old_rank}** → **{new_rank}**"
-            )
+            notifier_role = await self._get_or_create_notifier_role(guild)
+            role_mention = notifier_role.mention if notifier_role else f"@{_NOTIFIER_ROLE}"
+
+            # Split combined rank string into solo and flex components
+            old_parts = old_rank.split(" / ", 1)
+            new_parts = new_rank.split(" / ", 1)
+            old_solo = old_parts[0]
+            old_flex = old_parts[1] if len(old_parts) > 1 else old_parts[0]
+            new_solo = new_parts[0]
+            new_flex = new_parts[1] if len(new_parts) > 1 else new_parts[0]
+
+            changes: list[tuple[str, str, str]] = []
+            if old_solo != new_solo:
+                changes.append(("Solo/Duo", new_solo, "solo"))
+            if old_flex != new_flex:
+                changes.append(("Flex", new_flex, "flex"))
+
+            for queue_label, new_queue_rank, queue_key in changes:
+                old_queue_rank = old_solo if queue_key == "solo" else old_flex
+                is_uprank = rank_score(new_queue_rank) > rank_score(old_queue_rank)
+
+                if is_uprank:
+                    msg = (
+                        f"{role_mention} Wow! {person_mention} hat hart gecarried in **{queue_label}** "
+                        f"und erreicht jetzt Rang **{new_queue_rank}**. "
+                        f"Das neue Ranking ist jetzt **{new_solo}** und **{new_flex}**."
+                    )
+                else:
+                    msg = (
+                        f"{role_mention} Schade! {person_mention} wurde von seinen Teammates runtergerannt "
+                        f"in **{queue_label}** und leidet jetzt in Rang **{new_queue_rank}**. "
+                        f"Das neue Ranking ist jetzt **{new_solo}** und **{new_flex}**."
+                    )
+
+                await channel.send(msg)
+
         except ValueError:
             logger.exception(
                 "Invalid guild/channel/user id while sending rank update (discord_id=%s, guild_id=%s, channel_id=%s)",
-                discord_id,
-                guild_id,
-                channel_id,
+                discord_id, guild_id, channel_id,
             )
-            return
         except discord.Forbidden:
             logger.warning(
                 "Missing permissions to post rank update (discord_id=%s, guild_id=%s, channel_id=%s)",
-                discord_id,
-                guild_id,
-                channel_id,
+                discord_id, guild_id, channel_id,
             )
-            return
         except discord.HTTPException:
             logger.exception(
                 "Discord HTTP error while sending rank update (discord_id=%s, guild_id=%s, channel_id=%s)",
-                discord_id,
-                guild_id,
-                channel_id,
+                discord_id, guild_id, channel_id,
             )
-            return
 
     def cog_unload(self) -> None:
         self.update_nicknames.cancel()
@@ -112,7 +158,10 @@ class Riot(commands.Cog):
                     continue
 
                 last_rank = get_latest_rank(discord_id)
-                add_rank_snapshot(discord_id, rank)
+
+                # Only snapshot when rank actually changed
+                if last_rank is None or last_rank != rank:
+                    add_rank_snapshot(discord_id, rank)
 
                 if last_rank is not None and last_rank != rank:
                     await self._notify_rank_change(
@@ -197,6 +246,19 @@ class Riot(commands.Cog):
             guild_id=guild_id,
             channel_id=channel_id,
         )
+
+        # Add user to @BotNotifier role
+        if ctx.guild is not None:
+            member = ctx.guild.get_member(ctx.author.id)
+            if member is not None:
+                notifier_role = await self._get_or_create_notifier_role(ctx.guild)
+                if notifier_role is not None and notifier_role not in member.roles:
+                    try:
+                        await member.add_roles(notifier_role, reason="Linked Riot account via !addRiot")
+                    except discord.Forbidden:
+                        logger.warning("Cannot assign %s role to %s in %s", _NOTIFIER_ROLE, member, ctx.guild.name)
+                    except discord.HTTPException:
+                        logger.exception("Failed to assign %s role to %s", _NOTIFIER_ROLE, member)
 
         await ctx.send(
             f"Riot-Account **{riot_name}#{riot_tag}** wurde mit "
