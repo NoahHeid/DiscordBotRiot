@@ -14,17 +14,18 @@ Discord bot for linking Riot accounts to Discord users, showing Solo/Duo + Flex 
   - Fetches Riot rank data for all linked accounts
   - Updates nickname format to: `Name [SoloRank / FlexRank]`
   - Saves a rank snapshot to SQLite **only when the rank has changed**
-  - Notifies `@BotNotifier` when rank changed (see Rank Change Notifications below)
+  - Ensures a dedicated rank updates channel exists (`rank-updates-📈`, fallback: `rank-updates`)
+  - Posts rank change notifications (uprank/downrank) in that rank updates channel (see Rank Change Notifications below)
 
 ## Rank Display Format
 
 Nickname format:
 
-`PreferredName [N/A ⚪ / Plat III 💠]`
+`PreferredName [NA / P2]`
 
 - Left side = Solo/Duo rank (`RANKED_SOLO_5x5`)
 - Right side = Flex rank (`RANKED_FLEX_SR`)
-- Missing queue = `N/A ⚪`
+- Missing queue = `NA`
 
 ## Tech Stack
 
@@ -155,6 +156,10 @@ Shows linked Riot account.
 
 Shows rank change history (only entries where the rank actually changed) with timestamps.
 
+### `!help`
+
+Shows all available commands with short explanations and examples.
+
 ## Database Tables
 
 ### `riot_accounts`
@@ -175,15 +180,15 @@ Shows rank change history (only entries where the rank actually changed) with ti
 
 ## Rank Change Notifications
 
-When a rank changes, the bot pings `@BotNotifier` in the linked channel with a message depending on the direction:
+When a rank changes, the bot pings `@BotNotifier` in the dedicated rank updates channel (`rank-updates-📈`, fallback: `rank-updates`) with a message depending on the direction:
 
 **Uprank:**
 
-> `@BotNotifier Wow! @Person hat hart gecarried in Solo/Duo und erreicht jetzt Rang Gold II 🥇. Das neue Ranking ist jetzt Gold II 🥇 und N/A ⚪.`
+> `@BotNotifier Wow! @Person hat hart gecarried in Solo/Duo und erreicht jetzt Rang G2. Das neue Ranking ist jetzt G2 und NA.`
 
 **Downrank:**
 
-> `@BotNotifier Schade! @Person wurde von seinen Teammates runtergerannt in Flex und leidet jetzt in Rang Silver I 🥈. Das neue Ranking ist jetzt N/A ⚪ und Silver I 🥈.`
+> `@BotNotifier Schade! @Person wurde von seinen Teammates runtergerannt in Flex und leidet jetzt in Rang S1. Das neue Ranking ist jetzt NA und S1.`
 
 - The bot detects **per queue** (Solo/Duo and/or Flex) whether a change happened.
 - Up/downrank is determined by comparing numeric rank scores.
@@ -194,6 +199,7 @@ When a rank changes, the bot pings `@BotNotifier` in the linked channel with a m
 - Read messages / message content intent enabled
 - Change Nickname (`Manage Nicknames`)
 - Send Messages
+- Manage Channels (needed to auto-create `rank-updates-📈` / `rank-updates`)
 - Manage Roles (needed to create and assign `@BotNotifier`)
 
 ## GitHub Actions: Docker Build + GHCR Publish on `master`

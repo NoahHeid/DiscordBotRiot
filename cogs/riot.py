@@ -13,10 +13,12 @@ from db.database import (
     set_preferred_name,
     upsert_account,
 )
-from services.riot_api import fetch_rank, rank_score
+from services.riot_api import fetch_rank, normalize_combined_rank, rank_score
 
 _MAX_NICK = 32
 _NOTIFIER_ROLE = "BotNotifier"
+_RANK_UPDATES_CHANNEL_PREFERRED = "rank-updates-📈"
+_RANK_UPDATES_CHANNEL_FALLBACK = "rank-updates"
 logger = logging.getLogger(__name__)
 
 
@@ -60,24 +62,142 @@ class Riot(commands.Cog):
                 return None
         return role
 
+    def _find_rank_updates_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
+        existing_channel = discord.utils.get(guild.text_channels, name=_RANK_UPDATES_CHANNEL_PREFERRED)
+        if isinstance(existing_channel, discord.TextChannel):
+            return existing_channel
+
+        existing_channel = discord.utils.get(guild.text_channels, name=_RANK_UPDATES_CHANNEL_FALLBACK)
+        if isinstance(existing_channel, discord.TextChannel):
+            return existing_channel
+
+        for text_channel in guild.text_channels:
+            if text_channel.name.startswith("rank-updates"):
+                return text_channel
+
+        return None
+
+    def _build_rank_updates_channel_overwrites(
+        self,
+        guild: discord.Guild,
+        notifier_role: discord.Role | None,
+    ) -> dict[discord.Role | discord.Member | discord.Object, discord.PermissionOverwrite]:
+        overwrites: dict[discord.Role | discord.Member | discord.Object, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(
+                view_channel=False,
+                send_messages=False,
+                read_message_history=False,
+            )
+        }
+
+        if notifier_role is not None:
+            overwrites[notifier_role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=False,
+                read_message_history=True,
+                send_messages_in_threads=False,
+                create_public_threads=False,
+                create_private_threads=False,
+            )
+
+        for role in guild.roles:
+            if role.permissions.administrator:
+                overwrites[role] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    send_messages_in_threads=True,
+                )
+
+        bot_member = guild.get_member(self.bot.user.id) if self.bot.user is not None else None
+        if bot_member is not None:
+            overwrites[bot_member] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                send_messages_in_threads=True,
+            )
+
+        return overwrites
+
+    async def _ensure_rank_updates_channel_permissions(
+        self,
+        guild: discord.Guild,
+        channel: discord.TextChannel,
+        notifier_role: discord.Role | None,
+    ) -> None:
+        overwrites = self._build_rank_updates_channel_overwrites(guild, notifier_role)
+
+        if channel.overwrites == overwrites:
+            return
+
+        try:
+            await channel.edit(
+                overwrites=overwrites,
+                reason="Set private permissions for rank updates channel",
+            )
+        except discord.Forbidden:
+            logger.warning("Cannot set permissions for rank updates channel in %s", guild.name)
+        except discord.HTTPException:
+            logger.exception("Failed to set permissions for rank updates channel in %s", guild.name)
+
+    async def _get_or_create_rank_updates_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
+        notifier_role = await self._get_or_create_notifier_role(guild)
+
+        existing_channel = self._find_rank_updates_channel(guild)
+        if existing_channel is not None:
+            await self._ensure_rank_updates_channel_permissions(guild, existing_channel, notifier_role)
+            return existing_channel
+
+        overwrites = self._build_rank_updates_channel_overwrites(guild, notifier_role)
+
+        try:
+            return await guild.create_text_channel(
+                name=_RANK_UPDATES_CHANNEL_PREFERRED,
+                topic="Automatische Solo/Flex Rank-Updates (Uprank/Downrank)",
+                overwrites=overwrites,
+                reason="Auto-created by Ars Victoriae Discord Bot",
+            )
+        except discord.Forbidden:
+            logger.warning("Cannot create rank updates channel in %s (missing permissions)", guild.name)
+            return None
+        except discord.HTTPException:
+            logger.exception("Failed to create preferred rank updates channel in %s", guild.name)
+
+        try:
+            return await guild.create_text_channel(
+                name=_RANK_UPDATES_CHANNEL_FALLBACK,
+                topic="Automatische Solo/Flex Rank-Updates (Uprank/Downrank)",
+                overwrites=overwrites,
+                reason="Auto-created by Ars Victoriae Discord Bot",
+            )
+        except discord.Forbidden:
+            logger.warning("Cannot create fallback rank updates channel in %s (missing permissions)", guild.name)
+            return None
+        except discord.HTTPException:
+            logger.exception("Failed to create fallback rank updates channel in %s", guild.name)
+            return None
+
     async def _notify_rank_change(
         self,
         discord_id: str,
         guild_id: str | None,
-        channel_id: str | None,
         old_rank: str,
         new_rank: str,
     ) -> None:
-        if guild_id is None or channel_id is None:
+        if guild_id is None:
             return
+
+        old_rank = normalize_combined_rank(old_rank)
+        new_rank = normalize_combined_rank(new_rank)
 
         try:
             guild = self.bot.get_guild(int(guild_id))
             if guild is None:
                 return
 
-            channel = guild.get_channel(int(channel_id))
-            if not isinstance(channel, discord.TextChannel):
+            channel = await self._get_or_create_rank_updates_channel(guild)
+            if channel is None:
                 return
 
             member = guild.get_member(int(discord_id))
@@ -121,18 +241,18 @@ class Riot(commands.Cog):
 
         except ValueError:
             logger.exception(
-                "Invalid guild/channel/user id while sending rank update (discord_id=%s, guild_id=%s, channel_id=%s)",
-                discord_id, guild_id, channel_id,
+                "Invalid guild/user id while sending rank update (discord_id=%s, guild_id=%s)",
+                discord_id, guild_id,
             )
         except discord.Forbidden:
             logger.warning(
-                "Missing permissions to post rank update (discord_id=%s, guild_id=%s, channel_id=%s)",
-                discord_id, guild_id, channel_id,
+                "Missing permissions to post rank update (discord_id=%s, guild_id=%s)",
+                discord_id, guild_id,
             )
         except discord.HTTPException:
             logger.exception(
-                "Discord HTTP error while sending rank update (discord_id=%s, guild_id=%s, channel_id=%s)",
-                discord_id, guild_id, channel_id,
+                "Discord HTTP error while sending rank update (discord_id=%s, guild_id=%s)",
+                discord_id, guild_id,
             )
 
     def cog_unload(self) -> None:
@@ -140,6 +260,12 @@ class Riot(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
+        for guild in self.bot.guilds:
+            notifier_role = await self._get_or_create_notifier_role(guild)
+            existing_channel = self._find_rank_updates_channel(guild)
+            if existing_channel is not None:
+                await self._ensure_rank_updates_channel_permissions(guild, existing_channel, notifier_role)
+
         if not self.update_nicknames.is_running():
             self.update_nicknames.start()
 
@@ -151,24 +277,26 @@ class Riot(commands.Cog):
     async def update_nicknames(self) -> None:
         logger.info("Updating nicknames based on Riot ranks...")
         accounts = get_all_accounts()
-        for discord_id, riot_name, riot_tag, guild_id, channel_id, preferred_name in accounts:
+        for discord_id, riot_name, riot_tag, guild_id, _channel_id, preferred_name in accounts:
             try:
                 rank = await fetch_rank(riot_name, riot_tag)
                 if rank is None:
                     continue
 
+                rank = normalize_combined_rank(rank)
+
                 last_rank = get_latest_rank(discord_id)
+                normalized_last_rank = normalize_combined_rank(last_rank) if last_rank else None
 
                 # Only snapshot when rank actually changed
-                if last_rank is None or last_rank != rank:
+                if normalized_last_rank is None or normalized_last_rank != rank:
                     add_rank_snapshot(discord_id, rank)
 
-                if last_rank is not None and last_rank != rank:
+                if normalized_last_rank is not None and normalized_last_rank != rank:
                     await self._notify_rank_change(
                         discord_id=discord_id,
                         guild_id=guild_id,
-                        channel_id=channel_id,
-                        old_rank=last_rank,
+                        old_rank=normalized_last_rank,
                         new_rank=rank,
                     )
 
@@ -312,7 +440,7 @@ class Riot(commands.Cog):
             await ctx.send("Du musst zuerst deinen Riot-Account mit `!addRiot --name <Name> --tag <Tag>` verknüpfen.")
             return
 
-        latest_rank = get_latest_rank(discord_id) or "N/A ⚪ / N/A ⚪"
+        latest_rank = normalize_combined_rank(get_latest_rank(discord_id) or "NA / NA")
         if ctx.guild is not None:
             member = ctx.guild.get_member(ctx.author.id)
             if member is not None:
@@ -334,6 +462,30 @@ class Riot(commands.Cog):
                         )
 
         await ctx.send(f"Wunschname gespeichert (case-sensitive): **{desired_name}**")
+
+    @commands.command(name="help")
+    async def help_command(self, ctx: commands.Context) -> None:
+        lines = [
+            "**Verfügbare Commands:**",
+            "",
+            "`!addRiot --name <Name> --tag <Tag>`",
+            "Verknüpft deinen Riot-Account mit deinem Discord-User und gibt dir automatisch die Rolle `BotNotifier`.",
+            "Beispiel: `!addRiot --name Ars Noah --tag EUW`",
+            "",
+            "`!myRiot`",
+            "Zeigt deinen aktuell verknüpften Riot-Account an.",
+            "",
+            "`!rankHistory`",
+            "Zeigt deine letzten Rank-Änderungen (max. 10) mit Zeitstempel.",
+            "",
+            "`!setName --name <Name>`",
+            "Setzt deinen gewünschten Anzeigenamen (case-sensitive) für Nickname-Updates.",
+            "Beispiel: `!setName --name Ars Victoriae`",
+            "",
+            "`!help`",
+            "Zeigt diese Hilfe mit allen verfügbaren Commands an.",
+        ]
+        await ctx.send("\n".join(lines))
 
 
 async def setup(bot: commands.Bot) -> None:
