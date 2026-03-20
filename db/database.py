@@ -27,6 +27,7 @@ def init_db() -> None:
     _ensure_column(con, "riot_accounts", "guild_id", "guild_id TEXT")
     _ensure_column(con, "riot_accounts", "channel_id", "channel_id TEXT")
     _ensure_column(con, "riot_accounts", "preferred_name", "preferred_name TEXT")
+    _ensure_column(con, "riot_accounts", "show_rank", "show_rank INTEGER NOT NULL DEFAULT 1")
 
     con.execute("""
         CREATE TABLE IF NOT EXISTS rank_history (
@@ -76,13 +77,55 @@ def get_account(discord_id: str) -> tuple[str, str] | None:
     return row
 
 
-def get_all_accounts() -> list[tuple[str, str, str, str | None, str | None, str | None]]:
+def get_all_accounts() -> list[tuple[str, str, str, str | None, str | None, str | None, int]]:
     con = sqlite3.connect(DB_PATH)
     rows = con.execute(
-        "SELECT discord_id, riot_name, riot_tag, guild_id, channel_id, preferred_name FROM riot_accounts"
+        "SELECT discord_id, riot_name, riot_tag, guild_id, channel_id, preferred_name, COALESCE(show_rank, 1) FROM riot_accounts"
     ).fetchall()
     con.close()
     return rows
+
+
+def get_show_rank(discord_id: str) -> bool | None:
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT COALESCE(show_rank, 1) FROM riot_accounts WHERE discord_id = ?",
+        (discord_id,),
+    ).fetchone()
+    con.close()
+
+    if row is None:
+        return None
+
+    return bool(row[0])
+
+
+def toggle_show_rank(discord_id: str) -> bool | None:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.execute(
+        """
+        UPDATE riot_accounts
+        SET show_rank = CASE COALESCE(show_rank, 1) WHEN 1 THEN 0 ELSE 1 END
+        WHERE discord_id = ?
+        """,
+        (discord_id,),
+    )
+
+    if cur.rowcount <= 0:
+        con.close()
+        return None
+
+    row = con.execute(
+        "SELECT COALESCE(show_rank, 1) FROM riot_accounts WHERE discord_id = ?",
+        (discord_id,),
+    ).fetchone()
+    con.commit()
+    con.close()
+
+    if row is None:
+        return None
+
+    return bool(row[0])
 
 
 def set_preferred_name(discord_id: str, preferred_name: str) -> bool:
@@ -95,6 +138,20 @@ def set_preferred_name(discord_id: str, preferred_name: str) -> bool:
     changed = cur.rowcount > 0
     con.close()
     return changed
+
+
+def get_preferred_name(discord_id: str) -> str | None:
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT preferred_name FROM riot_accounts WHERE discord_id = ?",
+        (discord_id,),
+    ).fetchone()
+    con.close()
+
+    if row is None:
+        return None
+
+    return row[0]
 
 
 def get_latest_rank(discord_id: str) -> str | None:

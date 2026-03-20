@@ -8,11 +8,13 @@ Discord bot for linking Riot accounts to Discord users, showing Solo/Duo + Flex 
   - Automatically creates the `@BotNotifier` role on the server (if it doesn't exist yet)
   - Automatically adds the user to `@BotNotifier`
 - Set custom display name (case-sensitive): `!setName --name [NAME]`
+- Toggle rank display next to own name: `!toggleShowRank`
 - Show linked Riot account: `!myRiot`
 - Show rank change history with timestamp: `!rankHistory`
 - Every 5 minutes:
   - Fetches Riot rank data for all linked accounts
   - Updates nickname format to: `Name [SoloRank / FlexRank]`
+    - If `!toggleShowRank` is disabled by a user, only the name is shown (without rank)
   - Saves a rank snapshot to SQLite **only when the rank has changed**
   - Ensures a dedicated rank updates channel exists (`rank-updates-📈`, fallback: `rank-updates`)
   - Posts rank change notifications (uprank/downrank) in that rank updates channel (see Rank Change Notifications below)
@@ -155,6 +157,10 @@ Shows linked Riot account.
 ### `!rankHistory`
 
 Shows rank change history (only entries where the rank actually changed) with timestamps.
+
+### `!toggleShowRank`
+
+Turns rank display next to your own name on/off.
 
 ### `!help`
 

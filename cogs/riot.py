@@ -8,9 +8,12 @@ from db.database import (
     add_rank_snapshot,
     get_account,
     get_all_accounts,
+    get_preferred_name,
     get_rank_changes,
+    get_show_rank,
     get_latest_rank,
     set_preferred_name,
+    toggle_show_rank,
     upsert_account,
 )
 from services.riot_api import fetch_rank, normalize_combined_rank, rank_score
@@ -34,6 +37,10 @@ def _build_nickname(base_name: str, rank_text: str) -> str:
     if compact_max_base >= 1:
         return base_name[:compact_max_base] + compact_suffix
 
+    return base_name[:_MAX_NICK]
+
+
+def _build_plain_nickname(base_name: str) -> str:
     return base_name[:_MAX_NICK]
 
 
@@ -277,7 +284,7 @@ class Riot(commands.Cog):
     async def update_nicknames(self) -> None:
         logger.info("Updating nicknames based on Riot ranks...")
         accounts = get_all_accounts()
-        for discord_id, riot_name, riot_tag, guild_id, _channel_id, preferred_name in accounts:
+        for discord_id, riot_name, riot_tag, guild_id, _channel_id, preferred_name, show_rank in accounts:
             try:
                 rank = await fetch_rank(riot_name, riot_tag)
                 if rank is None:
@@ -307,7 +314,7 @@ class Riot(commands.Cog):
                         continue
 
                     base_name = preferred_name if preferred_name else member.name
-                    new_nick = _build_nickname(base_name, rank)
+                    new_nick = _build_nickname(base_name, rank) if bool(show_rank) else _build_plain_nickname(base_name)
 
                     if member.nick != new_nick:
                         try:
@@ -441,10 +448,11 @@ class Riot(commands.Cog):
             return
 
         latest_rank = normalize_combined_rank(get_latest_rank(discord_id) or "NA / NA")
+        show_rank = get_show_rank(discord_id)
         if ctx.guild is not None:
             member = ctx.guild.get_member(ctx.author.id)
             if member is not None:
-                new_nick = _build_nickname(desired_name, latest_rank)
+                new_nick = _build_nickname(desired_name, latest_rank) if show_rank is not False else _build_plain_nickname(desired_name)
                 if member.nick != new_nick:
                     try:
                         await member.edit(nick=new_nick)
@@ -462,6 +470,40 @@ class Riot(commands.Cog):
                         )
 
         await ctx.send(f"Wunschname gespeichert (case-sensitive): **{desired_name}**")
+
+    @commands.command(name="toggleShowRank")
+    async def toggle_show_rank_command(self, ctx: commands.Context) -> None:
+        discord_id = str(ctx.author.id)
+        new_show_rank = toggle_show_rank(discord_id)
+        if new_show_rank is None:
+            await ctx.send("Du musst zuerst deinen Riot-Account mit `!addRiot --name <Name> --tag <Tag>` verknüpfen.")
+            return
+
+        latest_rank = normalize_combined_rank(get_latest_rank(discord_id) or "NA / NA")
+        if ctx.guild is not None:
+            member = ctx.guild.get_member(ctx.author.id)
+            if member is not None:
+                preferred_name = get_preferred_name(discord_id) or member.name
+
+                new_nick = _build_nickname(preferred_name, latest_rank) if new_show_rank else _build_plain_nickname(preferred_name)
+                if member.nick != new_nick:
+                    try:
+                        await member.edit(nick=new_nick)
+                    except discord.Forbidden:
+                        logger.warning(
+                            "Cannot update nickname after toggleShowRank for %s in guild %s (missing permissions)",
+                            member,
+                            ctx.guild.name,
+                        )
+                    except discord.HTTPException:
+                        logger.exception(
+                            "Discord HTTP error while updating nickname after toggleShowRank for %s in guild %s",
+                            member,
+                            ctx.guild.name,
+                        )
+
+        status_text = "aktiviert" if new_show_rank else "deaktiviert"
+        await ctx.send(f"Rank-Anzeige neben deinem Namen wurde **{status_text}**.")
 
     @commands.command(name="help")
     async def help_command(self, ctx: commands.Context) -> None:
@@ -481,6 +523,9 @@ class Riot(commands.Cog):
             "`!setName --name <Name>`",
             "Setzt deinen gewünschten Anzeigenamen (case-sensitive) für Nickname-Updates.",
             "Beispiel: `!setName --name Ars Victoriae`",
+            "",
+            "`!toggleShowRank`",
+            "Schaltet die Anzeige deines Ranks neben deinem Namen ein oder aus.",
             "",
             "`!help`",
             "Zeigt diese Hilfe mit allen verfügbaren Commands an.",
