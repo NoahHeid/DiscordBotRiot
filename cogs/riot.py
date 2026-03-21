@@ -1,5 +1,6 @@
 import logging
 import re
+from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands, tasks
@@ -12,11 +13,17 @@ from db.database import (
     get_rank_changes,
     get_show_rank,
     get_latest_rank,
+    get_queue_tenure_start,
     set_preferred_name,
     toggle_show_rank,
     upsert_account,
 )
-from services.riot_api import fetch_rank, normalize_combined_rank, rank_score
+from services.riot_api import (
+    fetch_rank_with_context,
+    fetch_ranked_match_stats_since,
+    normalize_combined_rank,
+    rank_score,
+)
 
 _MAX_NICK = 32
 _NOTIFIER_ROLE = "BotNotifier"
@@ -42,6 +49,14 @@ def _build_nickname(base_name: str, rank_text: str) -> str:
 
 def _build_plain_nickname(base_name: str) -> str:
     return base_name[:_MAX_NICK]
+
+
+def _split_combined_rank(rank_text: str) -> tuple[str, str]:
+    parts = [part.strip() for part in rank_text.split("/", 1)]
+    if len(parts) == 1:
+        value = parts[0]
+        return value, value
+    return parts[0], parts[1]
 
 
 class Riot(commands.Cog):
@@ -191,6 +206,7 @@ class Riot(commands.Cog):
         guild_id: str | None,
         old_rank: str,
         new_rank: str,
+        queue_details: dict[str, tuple[int, int, str | None]],
     ) -> None:
         if guild_id is None:
             return
@@ -230,18 +246,22 @@ class Riot(commands.Cog):
             for queue_label, new_queue_rank, queue_key in changes:
                 old_queue_rank = old_solo if queue_key == "solo" else old_flex
                 is_uprank = rank_score(new_queue_rank) > rank_score(old_queue_rank)
+                days_spent, games_spent, _match_id = queue_details.get(queue_key, (0, 0, None))
+                days_text = "1 Tag" if days_spent == 1 else f"{days_spent} Tage"
 
                 if is_uprank:
                     msg = (
                         f"{role_mention} Wow! {person_mention} hat hart gecarried in **{queue_label}** "
                         f"und erreicht jetzt Rang **{new_queue_rank}**. "
-                        f"Das neue Ranking ist jetzt **{new_solo}** und **{new_flex}**."
+                        f"Das neue Ranking ist jetzt **{new_solo}** und **{new_flex}**. "
+                        f"Er/Sie verbrachte in **{old_queue_rank}** {days_text} beziehungsweise **{games_spent} Games**."
                     )
                 else:
                     msg = (
                         f"{role_mention} Schade! {person_mention} wurde von seinen Teammates runtergerannt "
                         f"in **{queue_label}** und leidet jetzt in Rang **{new_queue_rank}**. "
-                        f"Das neue Ranking ist jetzt **{new_solo}** und **{new_flex}**."
+                        f"Das neue Ranking ist jetzt **{new_solo}** und **{new_flex}**. "
+                        f"Er/Sie verbrachte in **{old_queue_rank}** {days_text} beziehungsweise **{games_spent} Games**."
                     )
 
                 await channel.send(msg)
@@ -286,7 +306,7 @@ class Riot(commands.Cog):
         accounts = get_all_accounts()
         for discord_id, riot_name, riot_tag, guild_id, _channel_id, preferred_name, show_rank in accounts:
             try:
-                rank = await fetch_rank(riot_name, riot_tag)
+                rank, puuid, routing = await fetch_rank_with_context(riot_name, riot_tag)
                 if rank is None:
                     continue
 
@@ -297,7 +317,46 @@ class Riot(commands.Cog):
 
                 # Only snapshot when rank actually changed
                 if normalized_last_rank is None or normalized_last_rank != rank:
-                    add_rank_snapshot(discord_id, rank)
+                    solo_match_id: str | None = None
+                    flex_match_id: str | None = None
+                    queue_details: dict[str, tuple[int, int, str | None]] = {}
+
+                    if normalized_last_rank is not None and puuid is not None and routing is not None:
+                        old_solo, old_flex = _split_combined_rank(normalized_last_rank)
+                        new_solo, new_flex = _split_combined_rank(rank)
+                        now_utc = datetime.now(timezone.utc)
+
+                        for queue_key, old_queue_rank, new_queue_rank in (
+                            ("solo", old_solo, new_solo),
+                            ("flex", old_flex, new_flex),
+                        ):
+                            if old_queue_rank == new_queue_rank:
+                                continue
+
+                            tenure_start = get_queue_tenure_start(discord_id, queue_key)
+                            if tenure_start is None:
+                                tenure_start = now_utc
+
+                            days_spent = max(0, int((now_utc - tenure_start).total_seconds() // 86400))
+                            games_spent, latest_match_id = await fetch_ranked_match_stats_since(
+                                puuid=puuid,
+                                routing=routing,
+                                queue_key=queue_key,
+                                since_utc=tenure_start,
+                            )
+                            queue_details[queue_key] = (days_spent, games_spent, latest_match_id)
+
+                            if queue_key == "solo":
+                                solo_match_id = latest_match_id
+                            elif queue_key == "flex":
+                                flex_match_id = latest_match_id
+
+                    add_rank_snapshot(
+                        discord_id=discord_id,
+                        rank=rank,
+                        solo_change_match_id=solo_match_id,
+                        flex_change_match_id=flex_match_id,
+                    )
 
                 if normalized_last_rank is not None and normalized_last_rank != rank:
                     await self._notify_rank_change(
@@ -305,6 +364,7 @@ class Riot(commands.Cog):
                         guild_id=guild_id,
                         old_rank=normalized_last_rank,
                         new_rank=rank,
+                        queue_details=queue_details,
                     )
 
                 logger.info("%s#%s -> %s", riot_name, riot_tag, rank)
@@ -420,10 +480,25 @@ class Riot(commands.Cog):
             await ctx.send("Noch keine Rank-Änderungen vorhanden.")
             return
 
-        lines = [
-            f"{checked_at} UTC → **{old_rank}** → **{new_rank}**"
-            for old_rank, new_rank, checked_at in history_rows
-        ]
+        lines: list[str] = []
+        for old_rank, new_rank, checked_at, solo_match_id, flex_match_id in history_rows:
+            base_line = f"{checked_at} UTC → **{old_rank}** → **{new_rank}**"
+
+            details: list[str] = []
+            if solo_match_id:
+                details.append(
+                    f"Solo Match: `{solo_match_id}` (https://www.op.gg/matches/{solo_match_id})"
+                )
+            if flex_match_id:
+                details.append(
+                    f"Flex Match: `{flex_match_id}` (https://www.op.gg/matches/{flex_match_id})"
+                )
+
+            if details:
+                lines.append(base_line + "\n  " + " | ".join(details))
+            else:
+                lines.append(base_line)
+
         await ctx.send("Deine letzten Rank-Changes:\n" + "\n".join(lines))
 
     @commands.command(name="setName")

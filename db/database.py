@@ -1,5 +1,6 @@
 import os
 import sqlite3
+from datetime import datetime, timezone
 
 from config import DB_PATH
 
@@ -37,6 +38,8 @@ def init_db() -> None:
             checked_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    _ensure_column(con, "rank_history", "solo_change_match_id", "solo_change_match_id TEXT")
+    _ensure_column(con, "rank_history", "flex_change_match_id", "flex_change_match_id TEXT")
     con.execute("""
         CREATE INDEX IF NOT EXISTS idx_rank_history_discord_time
         ON rank_history(discord_id, checked_at)
@@ -174,14 +177,66 @@ def get_latest_rank(discord_id: str) -> str | None:
     return row[0]
 
 
-def add_rank_snapshot(discord_id: str, rank: str) -> None:
+def add_rank_snapshot(
+    discord_id: str,
+    rank: str,
+    solo_change_match_id: str | None = None,
+    flex_change_match_id: str | None = None,
+) -> None:
     con = sqlite3.connect(DB_PATH)
     con.execute(
-        "INSERT INTO rank_history (discord_id, rank) VALUES (?, ?)",
-        (discord_id, rank),
+        """
+        INSERT INTO rank_history (discord_id, rank, solo_change_match_id, flex_change_match_id)
+        VALUES (?, ?, ?, ?)
+        """,
+        (discord_id, rank, solo_change_match_id, flex_change_match_id),
     )
     con.commit()
     con.close()
+
+
+def _split_rank(rank: str) -> tuple[str, str]:
+    parts = [part.strip() for part in rank.split("/", 1)]
+    if len(parts) == 1:
+        value = parts[0]
+        return value, value
+    return parts[0], parts[1]
+
+
+def _parse_checked_at(checked_at: str) -> datetime:
+    return datetime.strptime(checked_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+def get_queue_tenure_start(discord_id: str, queue_key: str) -> datetime | None:
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        """
+        SELECT rank, checked_at
+        FROM rank_history
+        WHERE discord_id = ?
+        ORDER BY checked_at ASC, id ASC
+        """,
+        (discord_id,),
+    ).fetchall()
+    con.close()
+
+    if not rows:
+        return None
+
+    index = 0 if queue_key == "solo" else 1
+
+    first_rank = _split_rank(str(rows[0][0]))
+    previous_queue_rank = first_rank[index]
+    first_checked_at = _parse_checked_at(str(rows[0][1]))
+    last_queue_change_at: datetime | None = None
+
+    for rank, checked_at in rows[1:]:
+        queue_rank = _split_rank(str(rank))[index]
+        if queue_rank != previous_queue_rank:
+            last_queue_change_at = _parse_checked_at(str(checked_at))
+        previous_queue_rank = queue_rank
+
+    return last_queue_change_at or first_checked_at
 
 
 def get_rank_history(discord_id: str, limit: int = 10) -> list[tuple[str, str]]:
@@ -200,11 +255,11 @@ def get_rank_history(discord_id: str, limit: int = 10) -> list[tuple[str, str]]:
     return rows
 
 
-def get_rank_changes(discord_id: str, limit: int = 10) -> list[tuple[str, str, str]]:
+def get_rank_changes(discord_id: str, limit: int = 10) -> list[tuple[str, str, str, str | None, str | None]]:
     con = sqlite3.connect(DB_PATH)
     rows = con.execute(
         """
-        SELECT rank, checked_at
+        SELECT rank, checked_at, solo_change_match_id, flex_change_match_id
         FROM rank_history
         WHERE discord_id = ?
         ORDER BY checked_at ASC, id ASC
@@ -213,16 +268,16 @@ def get_rank_changes(discord_id: str, limit: int = 10) -> list[tuple[str, str, s
     ).fetchall()
     con.close()
 
-    changes: list[tuple[str, str, str]] = []
+    changes: list[tuple[str, str, str, str | None, str | None]] = []
     previous_rank: str | None = None
 
-    for rank, checked_at in rows:
+    for rank, checked_at, solo_match_id, flex_match_id in rows:
         if previous_rank is None:
             previous_rank = rank
             continue
 
         if rank != previous_rank:
-            changes.append((previous_rank, rank, checked_at))
+            changes.append((previous_rank, rank, checked_at, solo_match_id, flex_match_id))
 
         previous_rank = rank
 

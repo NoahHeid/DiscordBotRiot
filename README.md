@@ -156,7 +156,7 @@ Shows linked Riot account.
 
 ### `!rankHistory`
 
-Shows rank change history (only entries where the rank actually changed) with timestamps.
+Shows rank change history (only entries where the rank actually changed) with timestamps and stored Solo/Flex match references (if available).
 
 ### `!toggleShowRank`
 

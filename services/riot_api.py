@@ -1,4 +1,9 @@
 import logging
+import asyncio
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 
 from pyke import Continent, Region, Pyke, exceptions
 
@@ -23,6 +28,18 @@ _TAG_TO_REGION: dict[str, tuple[Continent, Region]] = {
 }
 
 _DEFAULT_REGION = (Continent.EUROPE, Region.EUW)
+
+_CONTINENT_ROUTING: dict[Continent, str] = {
+    Continent.AMERICAS: "americas",
+    Continent.EUROPE: "europe",
+    Continent.ASIA: "asia",
+    Continent.SEA: "sea",
+}
+
+_QUEUE_ID_BY_KEY: dict[str, int] = {
+    "solo": 420,
+    "flex": 440,
+}
 
 _TIER_SHORT = {
     "IRON": "I",
@@ -148,7 +165,13 @@ def _format_entry_rank(entry: dict) -> str:
 
 
 async def fetch_rank(riot_name: str, riot_tag: str) -> str | None:
+    rank, _puuid, _routing = await fetch_rank_with_context(riot_name, riot_tag)
+    return rank
+
+
+async def fetch_rank_with_context(riot_name: str, riot_tag: str) -> tuple[str | None, str | None, str | None]:
     continent, region = _TAG_TO_REGION.get(riot_tag.upper(), _DEFAULT_REGION)
+    routing = _CONTINENT_ROUTING.get(continent, "europe")
 
     try:
         async with Pyke(RIOT_API_KEY, timeout=30) as api:
@@ -165,11 +188,102 @@ async def fetch_rank(riot_name: str, riot_tag: str) -> str | None:
 
         solo_rank = queue_to_rank.get("RANKED_SOLO_5x5", _UNRANKED)
         flex_rank = queue_to_rank.get("RANKED_FLEX_SR", _UNRANKED)
-        return f"{solo_rank} / {flex_rank}"
+        return f"{solo_rank} / {flex_rank}", puuid, routing
 
     except exceptions.DataNotFound:
         logger.warning("Riot account not found for %s#%s", riot_name, riot_tag)
-        return None
+        return None, None, None
     except Exception:
         logger.exception("Failed to fetch rank for %s#%s", riot_name, riot_tag)
-        return None
+        return None, None, None
+
+
+def _queue_id_from_key(queue_key: str) -> int | None:
+    return _QUEUE_ID_BY_KEY.get(queue_key)
+
+
+def _fetch_match_ids_page(
+    routing: str,
+    puuid: str,
+    queue_id: int,
+    start_time_unix: int,
+    start: int,
+    count: int,
+) -> list[str]:
+    params = urllib.parse.urlencode(
+        {
+            "type": "ranked",
+            "queue": queue_id,
+            "startTime": max(0, start_time_unix),
+            "start": start,
+            "count": count,
+        }
+    )
+    url = f"https://{routing}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?{params}"
+    request = urllib.request.Request(
+        url,
+        headers={"X-Riot-Token": RIOT_API_KEY},
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = response.read().decode("utf-8")
+
+    import json
+
+    parsed = json.loads(payload)
+    if not isinstance(parsed, list):
+        return []
+    return [str(match_id) for match_id in parsed]
+
+
+async def fetch_ranked_match_stats_since(
+    puuid: str,
+    routing: str,
+    queue_key: str,
+    since_utc: datetime,
+) -> tuple[int, str | None]:
+    queue_id = _queue_id_from_key(queue_key)
+    if queue_id is None:
+        return 0, None
+
+    if since_utc.tzinfo is None:
+        since_utc = since_utc.replace(tzinfo=timezone.utc)
+    since_unix = int(since_utc.timestamp())
+
+    all_match_ids: list[str] = []
+    page_start = 0
+    page_size = 100
+    max_matches = 1000
+
+    try:
+        while len(all_match_ids) < max_matches:
+            page = await asyncio.to_thread(
+                _fetch_match_ids_page,
+                routing,
+                puuid,
+                queue_id,
+                since_unix,
+                page_start,
+                page_size,
+            )
+            if not page:
+                break
+
+            all_match_ids.extend(page)
+            if len(page) < page_size:
+                break
+
+            page_start += page_size
+
+    except urllib.error.HTTPError:
+        logger.exception("Riot match endpoint HTTP error for puuid %s (queue=%s)", puuid, queue_key)
+        return 0, None
+    except urllib.error.URLError:
+        logger.exception("Riot match endpoint URL error for puuid %s (queue=%s)", puuid, queue_key)
+        return 0, None
+    except Exception:
+        logger.exception("Failed to fetch ranked match stats for puuid %s (queue=%s)", puuid, queue_key)
+        return 0, None
+
+    latest_match_id = all_match_ids[0] if all_match_ids else None
+    return len(all_match_ids), latest_match_id
