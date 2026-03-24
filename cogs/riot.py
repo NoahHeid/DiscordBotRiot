@@ -4,7 +4,9 @@ from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands, tasks
+from pyke import Pyke
 
+from config import RIOT_API_KEY
 from db.database import (
     add_rank_snapshot,
     get_account,
@@ -19,6 +21,7 @@ from db.database import (
     upsert_account,
 )
 from services.riot_api import (
+    fetch_last_game,
     fetch_rank_with_context,
     fetch_ranked_match_stats_since,
     normalize_combined_rank,
@@ -207,6 +210,8 @@ class Riot(commands.Cog):
         old_rank: str,
         new_rank: str,
         queue_details: dict[str, tuple[int, int, str | None]],
+        puuid: str | None = None,
+        routing: str | None = None,
     ) -> None:
         if guild_id is None:
             return
@@ -229,41 +234,17 @@ class Riot(commands.Cog):
             notifier_role = await self._get_or_create_notifier_role(guild)
             role_mention = notifier_role.mention if notifier_role else f"@{_NOTIFIER_ROLE}"
 
-            # Split combined rank string into solo and flex components
-            old_parts = old_rank.split(" / ", 1)
-            new_parts = new_rank.split(" / ", 1)
-            old_solo = old_parts[0]
-            old_flex = old_parts[1] if len(old_parts) > 1 else old_parts[0]
-            new_solo = new_parts[0]
-            new_flex = new_parts[1] if len(new_parts) > 1 else new_parts[0]
+            messages = await self.build_rank_change_messages_with_stats(
+                person_mention=person_mention,
+                role_mention=role_mention,
+                old_rank=old_rank,
+                new_rank=new_rank,
+                queue_details=queue_details,
+                puuid=puuid,
+                routing=routing,
+            )
 
-            changes: list[tuple[str, str, str]] = []
-            if old_solo != new_solo:
-                changes.append(("Solo/Duo", new_solo, "solo"))
-            if old_flex != new_flex:
-                changes.append(("Flex", new_flex, "flex"))
-
-            for queue_label, new_queue_rank, queue_key in changes:
-                old_queue_rank = old_solo if queue_key == "solo" else old_flex
-                is_uprank = rank_score(new_queue_rank) > rank_score(old_queue_rank)
-                days_spent, games_spent, _match_id = queue_details.get(queue_key, (0, 0, None))
-                days_text = "1 Tag" if days_spent == 1 else f"{days_spent} Tage"
-
-                if is_uprank:
-                    msg = (
-                        f"{role_mention} Wow! {person_mention} hat hart gecarried in **{queue_label}** "
-                        f"und erreicht jetzt Rang **{new_queue_rank}**. "
-                        f"Das neue Ranking ist jetzt **{new_solo}** und **{new_flex}**. "
-                        f"Er/Sie verbrachte in **{old_queue_rank}** {days_text} beziehungsweise **{games_spent} Games**."
-                    )
-                else:
-                    msg = (
-                        f"{role_mention} Schade! {person_mention} wurde von seinen Teammates runtergerannt "
-                        f"in **{queue_label}** und leidet jetzt in Rang **{new_queue_rank}**. "
-                        f"Das neue Ranking ist jetzt **{new_solo}** und **{new_flex}**. "
-                        f"Er/Sie verbrachte in **{old_queue_rank}** {days_text} beziehungsweise **{games_spent} Games**."
-                    )
-
+            for msg in messages:
                 await channel.send(msg)
 
         except ValueError:
@@ -282,35 +263,185 @@ class Riot(commands.Cog):
                 discord_id, guild_id,
             )
 
-    def cog_unload(self) -> None:
-        self.update_nicknames.cancel()
+    def build_rank_change_messages(
+        self,
+        person_mention: str,
+        role_mention: str,
+        old_rank: str,
+        new_rank: str,
+        queue_details: dict[str, tuple[int, int, str | None]],
+    ) -> list[str]:
+        old_rank = normalize_combined_rank(old_rank)
+        new_rank = normalize_combined_rank(new_rank)
 
-    @commands.Cog.listener()
-    async def on_ready(self) -> None:
-        for guild in self.bot.guilds:
-            notifier_role = await self._get_or_create_notifier_role(guild)
-            existing_channel = self._find_rank_updates_channel(guild)
-            if existing_channel is not None:
-                await self._ensure_rank_updates_channel_permissions(guild, existing_channel, notifier_role)
+        # Split combined rank string into solo and flex components
+        old_parts = old_rank.split(" / ", 1)
+        new_parts = new_rank.split(" / ", 1)
+        old_solo = old_parts[0]
+        old_flex = old_parts[1] if len(old_parts) > 1 else old_parts[0]
+        new_solo = new_parts[0]
+        new_flex = new_parts[1] if len(new_parts) > 1 else new_parts[0]
 
-        if not self.update_nicknames.is_running():
-            self.update_nicknames.start()
+        changes: list[tuple[str, str, str]] = []
+        if old_solo != new_solo:
+            changes.append(("Solo/Duo", new_solo, "solo"))
+        if old_flex != new_flex:
+            changes.append(("Flex", new_flex, "flex"))
 
-    # ------------------------------------------------------------------ #
-    #  Background task                                                     #
-    # ------------------------------------------------------------------ #
+        messages: list[str] = []
+        for queue_label, new_queue_rank, queue_key in changes:
+            old_queue_rank = old_solo if queue_key == "solo" else old_flex
+            is_uprank = rank_score(new_queue_rank) > rank_score(old_queue_rank)
+            days_spent, games_spent, _match_id = queue_details.get(queue_key, (0, 0, None))
+            days_text = "1 Tag" if days_spent == 1 else f"{days_spent} Tage"
 
-    @tasks.loop(minutes=5)
-    async def update_nicknames(self) -> None:
+            if is_uprank:
+                msg = (
+                    f"{role_mention} Wow! {person_mention} hat hart gecarried in **{queue_label}** "
+                    f"und erreicht jetzt Rang **{new_queue_rank}**. "
+                    f"Das neue Ranking ist jetzt **{new_solo}** und **{new_flex}**. "
+                    f"Er/Sie verbrachte in **{old_queue_rank}** {days_text} beziehungsweise **{games_spent} Games**."
+                )
+            else:
+                msg = (
+                    f"{role_mention} Schade! {person_mention} wurde von seinen Teammates runtergerannt "
+                    f"in **{queue_label}** und leidet jetzt in Rang **{new_queue_rank}**. "
+                    f"Das neue Ranking ist jetzt **{new_solo}** und **{new_flex}**. "
+                    f"Er/Sie verbrachte in **{old_queue_rank}** {days_text} beziehungsweise **{games_spent} Games**."
+                )
+
+            messages.append(msg)
+
+        return messages
+
+    async def build_rank_change_messages_with_stats(
+        self,
+        person_mention: str,
+        role_mention: str,
+        old_rank: str,
+        new_rank: str,
+        queue_details: dict[str, tuple[int, int, str | None]],
+        puuid: str | None = None,
+        routing: str | None = None,
+    ) -> list[str]:
+        """
+        Build rank change messages with enhanced stats from the rank change match.
+        
+        Args:
+            person_mention: Discord mention string
+            role_mention: Discord role mention string
+            old_rank: Old rank string (e.g., "G2 / D1")
+            new_rank: New rank string (e.g., "P1 / D1")
+            queue_details: Dict with queue_key -> (days_spent, games_spent, match_id)
+            puuid: Player PUUID for fetching match data
+            routing: Routing string for continent
+        
+        Returns:
+            List of message strings for Discord
+        """
+        from services.match_service import fetch_match_details
+        from services.match_analyzer import extract_player_stats
+        from pyke import Continent
+        
+        old_rank = normalize_combined_rank(old_rank)
+        new_rank = normalize_combined_rank(new_rank)
+
+        # Split combined rank string
+        old_parts = old_rank.split(" / ", 1)
+        new_parts = new_rank.split(" / ", 1)
+        old_solo = old_parts[0]
+        old_flex = old_parts[1] if len(old_parts) > 1 else old_parts[0]
+        new_solo = new_parts[0]
+        new_flex = new_parts[1] if len(new_parts) > 1 else new_parts[0]
+
+        changes: list[tuple[str, str, str]] = []
+        if old_solo != new_solo:
+            changes.append(("Solo/Duo", new_solo, "solo"))
+        if old_flex != new_flex:
+            changes.append(("Flex", new_flex, "flex"))
+
+        # Map routing to continent
+        routing_to_continent = {
+            "americas": Continent.AMERICAS,
+            "europe": Continent.EUROPE,
+            "asia": Continent.ASIA,
+            "sea": Continent.SEA,
+        }
+        continent = routing_to_continent.get(routing.lower() if routing else "europe", Continent.EUROPE)
+
+        messages: list[str] = []
+        for queue_label, new_queue_rank, queue_key in changes:
+            old_queue_rank = old_solo if queue_key == "solo" else old_flex
+            is_uprank = rank_score(new_queue_rank) > rank_score(old_queue_rank)
+            days_spent, games_spent, match_id = queue_details.get(queue_key, (0, 0, None))
+            days_text = "1 Tag" if days_spent == 1 else f"{days_spent} Tage"
+            
+            # Fetch match details if available
+            champion_name = None
+            position = None
+            kills = 0
+            deaths = 0
+            assists = 0
+            cs = 0
+            
+            if match_id and puuid:
+                try:
+                    match_data = await fetch_match_details(match_id, continent)
+                    if match_data:
+                        stats = extract_player_stats(match_data, puuid)
+                        if stats:
+                            champion_name = stats.get("championName", "Unknown")
+                            position = stats.get("individualPosition", "Unknown")
+                            kills = stats.get("kills", 0)
+                            deaths = stats.get("deaths", 0)
+                            assists = stats.get("assists", 0)
+                            cs = stats.get("totalMinionsKilled", 0)
+                except Exception as e:
+                    logger.debug(f"Failed to fetch match stats for {match_id}: {e}")
+
+            # Build message with stats if available
+            match_link = f"https://www.leagueofgraphs.com/de/match/euw/{match_id}" if match_id else None
+            ka_text = f"{kills}/{deaths}/{assists}" if champion_name else "(Keine Statistiken verfügbar)"
+            champion_text = f"{champion_name} in der {position} Lane" if champion_name else "überraschend gut"
+
+            if is_uprank:
+                msg = (
+                    f"{role_mention} Wow! {person_mention} ist in **{queue_label}** in **{new_queue_rank}** "
+                    f"aufgestiegen! Er war viel zu krass mit {champion_text} und konnte mit {ka_text} und {cs} CS "
+                    f"komplett carrien. Er verbrachte {days_text} und **{games_spent} Games** in **{old_queue_rank}**."
+                )
+            else:
+                msg = (
+                    f"{role_mention} Schade! {person_mention} ist in **{queue_label}** in **{new_queue_rank}** "
+                    f"abgestiegen. Seine Skills mit {champion_text} haben mit {ka_text} und {cs} CS nicht gereicht "
+                    f"um die Klasse zu halten. Er verbrachte {days_text} und **{games_spent} Games** in **{old_queue_rank}**."
+                )
+            
+            if match_link:
+                msg += f"\n{match_link}"
+
+            messages.append(msg)
+
+        return messages
+
+    async def run_update_nicknames_once(self) -> None:
         logger.info("Updating nicknames based on Riot ranks...")
         accounts = get_all_accounts()
-        for discord_id, riot_name, riot_tag, guild_id, _channel_id, preferred_name, show_rank in accounts:
+        for discord_id, riot_name, riot_tag, guild_id, _channel_id, preferred_name, show_rank, db_puuid in accounts:
             try:
-                rank, puuid, routing = await fetch_rank_with_context(riot_name, riot_tag)
+                rank, api_puuid, routing = await fetch_rank_with_context(riot_name, riot_tag)
                 if rank is None:
                     continue
 
                 rank = normalize_combined_rank(rank)
+                
+                # Use PUUID from API (most recent), fall back to DB
+                puuid = api_puuid or db_puuid
+                
+                # Save PUUID if we got it from API and it wasn't in DB
+                if api_puuid and not db_puuid:
+                    from db.database import save_puuid
+                    save_puuid(discord_id, api_puuid)
 
                 last_rank = get_latest_rank(discord_id)
                 normalized_last_rank = normalize_combined_rank(last_rank) if last_rank else None
@@ -365,6 +496,8 @@ class Riot(commands.Cog):
                         old_rank=normalized_last_rank,
                         new_rank=rank,
                         queue_details=queue_details,
+                        puuid=puuid,
+                        routing=routing,
                     )
 
                 logger.info("%s#%s -> %s", riot_name, riot_tag, rank)
@@ -399,6 +532,28 @@ class Riot(commands.Cog):
                     riot_tag,
                 )
 
+    def cog_unload(self) -> None:
+        self.update_nicknames.cancel()
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        for guild in self.bot.guilds:
+            notifier_role = await self._get_or_create_notifier_role(guild)
+            existing_channel = self._find_rank_updates_channel(guild)
+            if existing_channel is not None:
+                await self._ensure_rank_updates_channel_permissions(guild, existing_channel, notifier_role)
+
+        if not self.update_nicknames.is_running():
+            self.update_nicknames.start()
+
+    # ------------------------------------------------------------------ #
+    #  Background task                                                     #
+    # ------------------------------------------------------------------ #
+
+    @tasks.loop(minutes=5)
+    async def update_nicknames(self) -> None:
+        await self.run_update_nicknames_once()
+
     @update_nicknames.before_loop
     async def before_update(self) -> None:
         await self.bot.wait_until_ready()
@@ -431,6 +586,21 @@ class Riot(commands.Cog):
             )
             return
 
+        # Fetch PUUID for the account
+        puuid = None
+        try:
+            from pyke import Continent, Region
+            from services.riot_api import _TAG_TO_REGION, _CONTINENT_ROUTING
+            
+            continent, region = _TAG_TO_REGION.get(riot_tag.upper(), (Continent.EUROPE, Region.EUW))
+            
+            async with Pyke(RIOT_API_KEY, timeout=30) as api:
+                account = await api.account.by_riot_id(continent, riot_name, riot_tag)
+                puuid = account.get("puuid")
+        except Exception as e:
+            logger.warning(f"Failed to fetch PUUID for {riot_name}#{riot_tag}: {e}")
+            # Continue without PUUID; it can be fetched later
+
         discord_id = str(ctx.author.id)
         guild_id = str(ctx.guild.id) if ctx.guild is not None else None
         channel_id = str(ctx.channel.id)
@@ -440,6 +610,7 @@ class Riot(commands.Cog):
             riot_tag=riot_tag,
             guild_id=guild_id,
             channel_id=channel_id,
+            puuid=puuid,
         )
 
         # Add user to @BotNotifier role
@@ -468,7 +639,7 @@ class Riot(commands.Cog):
         if row is None:
             await ctx.send("Du hast noch keinen Riot-Account verknüpft. Benutze `!addRiot --name <Name> --tag <Tag>`.")
         else:
-            riot_name, riot_tag = row
+            riot_name, riot_tag, _puuid = row
             await ctx.send(f"Dein verknüpfter Riot-Account: **{riot_name}#{riot_tag}**")
 
     @commands.command(name="rankHistory")

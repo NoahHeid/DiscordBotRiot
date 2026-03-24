@@ -1,23 +1,27 @@
 # Ars Victoriae Discord Bot
 
-Discord bot for linking Riot accounts to Discord users, showing Solo/Duo + Flex rank in nicknames, storing rank history, and notifying users about rank changes.
+Discord bot for linking Riot accounts to Discord users, showing Solo/Duo + Flex rank in nicknames, storing rank history, and notifying users about rank changes including match context.
 
 ## Features
 
 - Link Riot account to Discord user: `!addRiot --name [NAME] --tag [TAG]`
   - Automatically creates the `@BotNotifier` role on the server (if it doesn't exist yet)
   - Automatically adds the user to `@BotNotifier`
+  - Fetches and stores the player's `puuid` (if Riot API lookup succeeds)
 - Set custom display name (case-sensitive): `!setName --name [NAME]`
 - Toggle rank display next to own name: `!toggleShowRank`
 - Show linked Riot account: `!myRiot`
 - Show rank change history with timestamp: `!rankHistory`
 - Every 5 minutes:
   - Fetches Riot rank data for all linked accounts
+  - Backfills missing `puuid` values for already linked users
   - Updates nickname format to: `Name [SoloRank / FlexRank]`
     - If `!toggleShowRank` is disabled by a user, only the name is shown (without rank)
   - Saves a rank snapshot to SQLite **only when the rank has changed**
+  - On rank change, stores the latest matching queue match id (Solo/Flex) in DB
+  - Calculates queue-specific tenure data (`days` + `games since last queue change`)
   - Ensures a dedicated rank updates channel exists (`rank-updates-📈`, fallback: `rank-updates`)
-  - Posts rank change notifications (uprank/downrank) in that rank updates channel (see Rank Change Notifications below)
+  - Posts rank change notifications (uprank/downrank) in that rank updates channel with champion, role, K/D/A, CS and game link (see Rank Change Notifications below)
 
 ## Rank Display Format
 
@@ -50,7 +54,9 @@ Nickname format:
 ├── db/
 │   └── database.py
 ├── services/
-│   └── riot_api.py
+│   ├── riot_api.py
+│   ├── match_service.py
+│   └── match_analyzer.py
 ├── data/
 │   └── riot_accounts.db
 ├── Dockerfile
@@ -137,6 +143,7 @@ Links Riot account to Discord user.
 
 - Automatically creates the `@BotNotifier` role on the server if it doesn't exist.
 - Automatically assigns the `@BotNotifier` role to the user.
+- Fetches and stores `puuid` for the linked account (if available).
 
 Example:
 
@@ -176,6 +183,8 @@ Shows all available commands with short explanations and examples.
 - `guild_id`
 - `channel_id`
 - `preferred_name`
+- `show_rank` (0/1)
+- `puuid`
 
 ### `rank_history`
 
@@ -183,21 +192,37 @@ Shows all available commands with short explanations and examples.
 - `discord_id`
 - `rank`
 - `checked_at` (timestamp)
+- `solo_change_match_id`
+- `flex_change_match_id`
+- `games_since_last_change` (currently reserved for future use)
 
 ## Rank Change Notifications
 
-When a rank changes, the bot pings `@BotNotifier` in the dedicated rank updates channel (`rank-updates-📈`, fallback: `rank-updates`) with a message depending on the direction:
+When a rank changes, the bot pings `@BotNotifier` in the dedicated rank updates channel (`rank-updates-📈`, fallback: `rank-updates`) with a message depending on the direction.
+
+The message contains:
+
+- Queue (`Solo/Duo` or `Flex`)
+- New and previous queue rank
+- Time and games spent in previous queue rank
+- Champion, lane/position, K/D/A and CS from the fetched rank-change match (if match data is available)
+- League of Graphs game link (`https://www.leagueofgraphs.com/de/match/euw/{MATCH_ID}`)
 
 **Uprank:**
 
-> `@BotNotifier Wow! @Person hat hart gecarried in Solo/Duo und erreicht jetzt Rang G2. Das neue Ranking ist jetzt G2 und NA.`
+> `@BotNotifier Wow! @Person ist in Solo/Duo in G2 aufgestiegen! Er war viel zu krass mit Warwick in der TOP Lane und konnte mit 18/4/3 und 197 CS komplett carrien. Er verbrachte 2 Tage und 9 Games in G3.`
+>
+> `https://www.leagueofgraphs.com/de/match/euw/EUW1_7796905964`
 
 **Downrank:**
 
-> `@BotNotifier Schade! @Person wurde von seinen Teammates runtergerannt in Flex und leidet jetzt in Rang S1. Das neue Ranking ist jetzt NA und S1.`
+> `@BotNotifier Schade! @Person ist in Flex in S1 abgestiegen. Seine Skills mit Nami in der UTILITY Lane haben mit 1/6/8 und 36 CS nicht gereicht um die Klasse zu halten. Er verbrachte 5 Tage und 14 Games in S2.`
+>
+> `https://www.leagueofgraphs.com/de/match/euw/EUW1_7796905964`
 
 - The bot detects **per queue** (Solo/Duo and/or Flex) whether a change happened.
 - Up/downrank is determined by comparing numeric rank scores.
+- Game counting is queue-specific (Solo queue id 420, Flex queue id 440).
 - The `@BotNotifier` role is created automatically with **mentionable** set to `true`.
 
 ## Permissions Needed in Discord

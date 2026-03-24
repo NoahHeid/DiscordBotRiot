@@ -29,6 +29,7 @@ def init_db() -> None:
     _ensure_column(con, "riot_accounts", "channel_id", "channel_id TEXT")
     _ensure_column(con, "riot_accounts", "preferred_name", "preferred_name TEXT")
     _ensure_column(con, "riot_accounts", "show_rank", "show_rank INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(con, "riot_accounts", "puuid", "puuid TEXT")
 
     con.execute("""
         CREATE TABLE IF NOT EXISTS rank_history (
@@ -40,6 +41,7 @@ def init_db() -> None:
     """)
     _ensure_column(con, "rank_history", "solo_change_match_id", "solo_change_match_id TEXT")
     _ensure_column(con, "rank_history", "flex_change_match_id", "flex_change_match_id TEXT")
+    _ensure_column(con, "rank_history", "games_since_last_change", "games_since_last_change INTEGER")
     con.execute("""
         CREATE INDEX IF NOT EXISTS idx_rank_history_discord_time
         ON rank_history(discord_id, checked_at)
@@ -55,35 +57,37 @@ def upsert_account(
     riot_tag: str,
     guild_id: str | None = None,
     channel_id: str | None = None,
+    puuid: str | None = None,
 ) -> None:
     con = sqlite3.connect(DB_PATH)
     con.execute("""
-        INSERT INTO riot_accounts (discord_id, riot_name, riot_tag, guild_id, channel_id)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO riot_accounts (discord_id, riot_name, riot_tag, guild_id, channel_id, puuid)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(discord_id) DO UPDATE SET
             riot_name = excluded.riot_name,
             riot_tag  = excluded.riot_tag,
             guild_id  = COALESCE(excluded.guild_id, riot_accounts.guild_id),
-            channel_id = COALESCE(excluded.channel_id, riot_accounts.channel_id)
-    """, (discord_id, riot_name, riot_tag, guild_id, channel_id))
+            channel_id = COALESCE(excluded.channel_id, riot_accounts.channel_id),
+            puuid = COALESCE(excluded.puuid, riot_accounts.puuid)
+    """, (discord_id, riot_name, riot_tag, guild_id, channel_id, puuid))
     con.commit()
     con.close()
 
 
-def get_account(discord_id: str) -> tuple[str, str] | None:
+def get_account(discord_id: str) -> tuple[str, str, str | None] | None:
     con = sqlite3.connect(DB_PATH)
     row = con.execute(
-        "SELECT riot_name, riot_tag FROM riot_accounts WHERE discord_id = ?",
+        "SELECT riot_name, riot_tag, puuid FROM riot_accounts WHERE discord_id = ?",
         (discord_id,)
     ).fetchone()
     con.close()
     return row
 
 
-def get_all_accounts() -> list[tuple[str, str, str, str | None, str | None, str | None, int]]:
+def get_all_accounts() -> list[tuple[str, str, str, str | None, str | None, str | None, int, str | None]]:
     con = sqlite3.connect(DB_PATH)
     rows = con.execute(
-        "SELECT discord_id, riot_name, riot_tag, guild_id, channel_id, preferred_name, COALESCE(show_rank, 1) FROM riot_accounts"
+        "SELECT discord_id, riot_name, riot_tag, guild_id, channel_id, preferred_name, COALESCE(show_rank, 1), puuid FROM riot_accounts"
     ).fetchall()
     con.close()
     return rows
@@ -282,3 +286,25 @@ def get_rank_changes(discord_id: str, limit: int = 10) -> list[tuple[str, str, s
         previous_rank = rank
 
     return list(reversed(changes[-limit:]))
+
+
+def get_puuid(discord_id: str) -> str | None:
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT puuid FROM riot_accounts WHERE discord_id = ?",
+        (discord_id,)
+    ).fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+def save_puuid(discord_id: str, puuid: str) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.execute(
+        "UPDATE riot_accounts SET puuid = ? WHERE discord_id = ?",
+        (puuid, discord_id)
+    )
+    con.commit()
+    changed = cur.rowcount > 0
+    con.close()
+    return changed
