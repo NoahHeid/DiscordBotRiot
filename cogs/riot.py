@@ -21,7 +21,6 @@ from db.database import (
     upsert_account,
 )
 from services.riot_api import (
-    fetch_last_game,
     fetch_rank_with_context,
     fetch_ranked_match_stats_since,
     normalize_combined_rank,
@@ -400,7 +399,9 @@ class Riot(commands.Cog):
                     logger.debug(f"Failed to fetch match stats for {match_id}: {e}")
 
             # Build message with stats if available
-            match_link = f"https://www.leagueofgraphs.com/de/match/euw/{match_id}" if match_id else None
+            
+            match_id_for_link = match_id.split("_", 1)[1] if match_id and "_" in match_id else match_id
+            match_link = f"https://www.leagueofgraphs.com/de/match/euw/{match_id_for_link}" if match_id_for_link else None
             ka_text = f"{kills}/{deaths}/{assists}" if champion_name else "(Keine Statistiken verfügbar)"
             champion_text = f"{champion_name} in der {position} Lane" if champion_name else "überraschend gut"
 

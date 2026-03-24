@@ -197,18 +197,6 @@ async def fetch_rank_with_context(riot_name: str, riot_tag: str) -> tuple[str | 
         logger.exception("Failed to fetch rank for %s#%s", riot_name, riot_tag)
         return None, None, None
 
-async def fetch_last_game(riot_name: str, riot_tag: str):
-      print("Fetching last game for testing...")
-      async with Pyke(RIOT_API_KEY, timeout=30) as api:
-        continent, region = _TAG_TO_REGION.get(riot_tag.upper(), _DEFAULT_REGION)
-        routing = _CONTINENT_ROUTING.get(continent, "europe")
-        account = await api.account.by_riot_id(continent, riot_name, riot_tag)
-        puuid: str = account["puuid"]
-        print(f"PUUID for {riot_name}#{riot_tag}: {puuid}")
-        match_ids = await api.match.match_ids_by_puuid(Continent.EUROPE, puuid, count=1)
-        print(f"Last match ID for {riot_name}#{riot_tag}: {match_ids[0] if match_ids else 'No matches found'}")
-
-
 async def fetch_ranked_match_stats_since(
     puuid: str,
     routing: str,
